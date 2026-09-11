@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+
+set -u
+
+"$PI_HOME/bin/pi-hunk-relay" ensure
+
+docker run --rm -it \
+  -v "$PWD:/workspace" \
+  -v ~/.pi/agent:/root/.pi/agent \
+   -e HOST_PWD="${PWD/#$HOME/~}" \
+   -e PI_WRAPPER_HUNK_ENABLED=1 \
+   -e HUNK_RELAY_TARGET_HOST=host.docker.internal \
+   -e HUNK_RELAY_TARGET_PORT="${HUNK_HOST_RELAY_PORT:-47658}" \
+   -v "$PI_HOME/bin/tcp-relay.mjs:/tmp/pi-tcp-relay.mjs:ro" \
+   -v "$PI_HOME/bin/pi-hunk-entrypoint.sh:/tmp/pi-hunk-entrypoint.sh:ro" \
+   --entrypoint /tmp/pi-hunk-entrypoint.sh \
+  pi-sandbox
+

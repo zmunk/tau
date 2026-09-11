@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""TFS–Hunk review workflow CLI."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import unicodedata
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import unquote
+
+TMP_DIR = Path("/tmp/pr")
+REPOSITORY_URL_PATTERN = re.compile(
+    r"^(?P<base>https?://[^/]+/tfs/DefaultCollection)"
+    r"/(?P<project>[^/]+)/_git/(?P<repo>[^/?#]+)(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
+PR_URL_PATTERN = re.compile(
+    REPOSITORY_URL_PATTERN.pattern.removesuffix("(?:[/?#].*)?$")
+    + r"/pullrequest/(?P<pr>[0-9]+)(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
+
+
+class ToolError(RuntimeError):
+    pass
+
+
+def parse_repository_url(url: str) -> dict[str, str]:
+    match = REPOSITORY_URL_PATTERN.match(url)
+    if not match:
+        raise ToolError("origin is not an HTTP TFS repository URL")
+    return {key: unquote(value) for key, value in match.groupdict().items()}
+
+
+def active_pull_requests(info: dict[str, str]) -> list[dict[str, Any]]:
+    target = (
+        f"{info['base']}/{info['project']}/_apis/git/repositories/{info['repo']}"
+        "/pullRequests?searchCriteria.status=active&api-version=6.0"
+    )
+    document = json.loads(curl_json("GET", target))
+    pull_requests = document.get("value")
+    if not isinstance(pull_requests, list):
+        raise ToolError("Pull request API response does not contain a pull request list")
+    return [
+        pull_request
+        for pull_request in pull_requests
+        if isinstance(pull_request, dict) and pull_request.get("status") == "active"
+    ]
+
+
+def select_active_pr(repository: Path) -> str:
+    info = parse_repository_url(
+        run(["git", "-C", str(repository), "remote", "get-url", "origin"]).strip()
+    )
+    pull_requests = active_pull_requests(info)
+    if not pull_requests:
+        raise ToolError("No active pull requests found for origin")
+    if len(pull_requests) == 1:
+        selected = pull_requests[0]
+    else:
+        print("Active pull requests:")
+        for index, pull_request in enumerate(pull_requests, start=1):
+            print(
+                f"  {index}. #{pull_request.get('pullRequestId', '?')} "
+                f"{one_line(pull_request.get('title', ''))} "
+                f"({pull_request.get('sourceRefName', '?')} → "
+                f"{pull_request.get('targetRefName', '?')})"
+            )
+        try:
+            choice = int(input("Select a pull request: ").strip())
+            if not 1 <= choice <= len(pull_requests):
+                raise ValueError
+            selected = pull_requests[choice - 1]
+        except (EOFError, ValueError):
+            raise ToolError("Invalid pull request selection") from None
+
+    pr_id = selected.get("pullRequestId")
+    if not isinstance(pr_id, int):
+        raise ToolError("Pull request API response does not contain a pull request ID")
+    return f"{info['base']}/{info['project']}/_git/{info['repo']}/pullrequest/{pr_id}"
+
+
+def require_url(value: str | None, repository: Path | None = None) -> str:
+    return value or os.environ.get("PR_URL") or select_active_pr(repository or Path.cwd())
+
+
+def parse_pr_url(url: str) -> dict[str, str]:
+    match = PR_URL_PATTERN.match(url)
+    if not match:
+        raise ToolError("URL does not match the expected TFS pull-request format")
+    return {key: unquote(value) for key, value in match.groupdict().items()}
+
+
+def api_url(info: dict[str, str], suffix: str) -> str:
+    return (
+        f"{info['base']}/{info['project']}/_apis/git/repositories/"
+        f"{info['repo']}/pullRequests/{info['pr']}{suffix}"
+    )
+
+
+def build_api_url(info: dict[str, str], build_id: int | None = None) -> str:
+    target = f"{info['base']}/{info['project']}/_apis/build/builds"
+    if build_id is not None:
+        return f"{target}/{build_id}?api-version=6.0"
+    return (
+        f"{target}?branchName=refs/pull/{info['pr']}/merge"
+        "&queryOrder=queueTimeDescending&api-version=6.0"
+    )
+
+
+def run(command: list[str], *, input_text: str | None = None) -> str:
+    result = subprocess.run(
+        command,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip()
+        raise ToolError(message or f"Command failed: {command[0]}")
+    return result.stdout
+
+
+def run_import_with_spinner(url: str, repo: Path) -> int:
+    spinner = shutil.which("spinner")
+    if spinner is None:
+        import_comments(url, repo)
+        return 0
+
+    env = os.environ.copy()
+    env["TFS_IMPORT_NO_SPINNER"] = "1"
+    result = subprocess.run(
+        [spinner, "tfs", "import", url, "--repo", str(repo)],
+        env=env,
+    )
+    return result.returncode
+
+
+def curl_json(method: str, url: str, payload: dict[str, Any] | None = None) -> str:
+    command = ["curl.exe", "-sS", "--negotiate", "-u", ":"]
+    if payload is not None:
+        command += [
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            json.dumps(payload, ensure_ascii=False),
+        ]
+    else:
+        command += ["-H", "Accept: application/json"]
+    command += ["-X", method, url]
+    return run(command)
+
+
+def fetch_builds(url: str) -> list[dict[str, Any]]:
+    info = parse_pr_url(url)
+    document = json.loads(curl_json("GET", build_api_url(info)))
+    builds = document.get("value")
+    if not isinstance(builds, list):
+        raise ToolError("Build API response does not contain a build list")
+    return [build for build in builds if isinstance(build, dict)]
+
+
+def build_record(build: dict[str, Any]) -> dict[str, Any]:
+    definition = build.get("definition")
+    definition_name = definition.get("name") if isinstance(definition, dict) else None
+    return {
+        "id": build.get("id"),
+        "buildNumber": build.get("buildNumber"),
+        "status": build.get("status"),
+        "result": build.get("result"),
+        "sourceBranch": build.get("sourceBranch"),
+        "definitionName": definition_name,
+    }
+
+
+def show_builds(url: str, as_json: bool) -> None:
+    records = [build_record(build) for build in fetch_builds(url)]
+    if as_json:
+        print(json.dumps(records, indent=2, ensure_ascii=False))
+        return
+    rows = [
+        [
+            record["id"],
+            record["buildNumber"],
+            record["status"],
+            record["result"],
+            record["sourceBranch"],
+            record["definitionName"],
+        ]
+        for record in records
+    ]
+    print_table(
+        ["id", "buildNumber", "status", "result", "sourceBranch", "definition"],
+        rows,
+        flexible={1, 4, 5},
+    )
+
+
+def show_build_status(url: str, build_id: int) -> None:
+    info = parse_pr_url(url)
+    document = json.loads(curl_json("GET", build_api_url(info, build_id)))
+    status = document.get("status")
+    if not isinstance(status, str):
+        raise ToolError("Build API response does not contain a status")
+    print(status)
+
+
+def show_builds_status(url: str) -> None:
+    builds = fetch_builds(url)
+    if not builds:
+        print("noBuilds")
+    elif any(build.get("status") != "completed" for build in builds):
+        print("inProgress")
+    elif all(build.get("result") == "succeeded" for build in builds):
+        print("succeeded")
+    else:
+        print("failed")
+
+
+def fetch_comments(url: str) -> Path:
+    info = parse_pr_url(url)
+    target = api_url(info, "/threads?api-version=6.1-preview")
+    raw = curl_json("GET", target)
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    output = TMP_DIR / f"{info['pr']}.json"
+    output.write_text(raw, encoding="utf-8")
+    return output
+
+
+def post_reply(url: str, thread_id: str, content: str) -> str:
+    info = parse_pr_url(url)
+    target = api_url(
+        info,
+        f"/threads/{thread_id}/comments?api-version=6.1-preview",
+    )
+    return curl_json("POST", target, {"content": content})
+
+
+def resolve_thread(url: str, thread_id: str, status: str) -> str:
+    info = parse_pr_url(url)
+    target = api_url(info, f"/threads/{thread_id}?api-version=6.1-preview")
+    return curl_json("PATCH", target, {"status": status})
+
+
+def import_comments(url: str, repo: Path) -> None:
+    run(["hunk", "session", "get", "--repo", str(repo)])
+    raw_file = fetch_comments(url)
+    info = parse_pr_url(url)
+
+    document = json.loads(raw_file.read_text(encoding="utf-8"))
+    records: list[dict[str, Any]] = []
+    for thread in document.get("value", []):
+        if thread.get("status") != "active" or thread.get("threadContext") is None:
+            continue
+        context = thread["threadContext"]
+        file_path = (context.get("filePath") or "").lstrip("/")
+        line = (context.get("rightFileStart") or {}).get("line") or 1
+        for comment in thread.get("comments", []):
+            records.append(
+                {
+                    "threadId": thread.get("id"),
+                    "status": thread.get("status"),
+                    "author": (comment.get("author") or {}).get("displayName", ""),
+                    "filePath": file_path,
+                    "line": line,
+                    "content": comment.get("content", ""),
+                }
+            )
+
+    clean_file = TMP_DIR / f"{info['pr']}-clean.json"
+    clean_file.write_text(
+        json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    failures = 0
+    for record in records:
+        try:
+            run(
+                [
+                    "hunk",
+                    "session",
+                    "comment",
+                    "add",
+                    "--repo",
+                    str(repo),
+                    "--file",
+                    record["filePath"],
+                    "--new-line",
+                    str(record["line"]),
+                    "--summary",
+                    record["content"],
+                    "--author",
+                    record["author"],
+                    "--rationale",
+                    f"threadId: {record['threadId']}",
+                ]
+            )
+        except ToolError as error:
+            failures += 1
+            print(
+                f"FAILED: {record['filePath']}:{record['line']} -> {error}",
+                file=sys.stderr,
+            )
+    if failures:
+        raise ToolError(f"Failed to import {failures} comment(s)")
+
+
+def compile_replies(repo: Path) -> Path:
+    output = run(
+        ["hunk", "session", "comment", "list", "--repo", str(repo), "--json"]
+    )
+    document = json.loads(output)
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for comment in document.get("comments", []):
+        rationale = comment.get("rationale")
+        if not isinstance(rationale, str) or not rationale.startswith("threadId: "):
+            continue
+        groups[rationale.removeprefix("threadId: ")].append(comment)
+
+    replies: list[dict[str, Any]] = []
+    for thread_id, comments in groups.items():
+        agent_replies = [item for item in comments if item.get("author") == "agent"]
+        if not agent_replies:
+            continue
+        reply = agent_replies[0]
+        replies.append(
+            {
+                "thread_id": thread_id,
+                "reply_hunk_id": reply.get("commentId"),
+                "comments": [
+                    {
+                        "commentId": item.get("commentId"),
+                        "summary": item.get("summary", ""),
+                    }
+                    for item in comments
+                    if item.get("author") != "agent"
+                ],
+                "reply": reply.get("summary", ""),
+            }
+        )
+
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    repo_name = repo.resolve().name
+    target = TMP_DIR / f"pi-hunk-replies-{repo_name}-{timestamp}.json"
+    target.write_text(
+        json.dumps(replies, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return target
+
+
+def source_comments(row: dict[str, Any]) -> list[dict[str, Any]]:
+    comments = row.get("comments")
+    if isinstance(comments, list):
+        return [item for item in comments if isinstance(item, dict)]
+    comment = row.get("comment")
+    if comment is not None:
+        return [{"summary": str(comment)}]
+    return []
+
+
+def one_line(value: Any) -> str:
+    return str(value if value is not None else "").replace("\r", " ").replace("\n", " ")
+
+
+def display_width(value: str) -> int:
+    return sum(
+        0
+        if unicodedata.combining(character)
+        or unicodedata.category(character) in {"Mn", "Me", "Cf"}
+        else 2
+        if unicodedata.east_asian_width(character) in {"W", "F"}
+        else 1
+        for character in value
+    )
+
+
+def print_table(
+    headers: list[str], rows: list[list[Any]], flexible: set[int]
+) -> None:
+    rendered = [[one_line(value) for value in row] for row in rows]
+    widths = [display_width(header) for header in headers]
+    for row in rendered:
+        for index, value in enumerate(row):
+            widths[index] = max(widths[index], display_width(value))
+
+    available = shutil.get_terminal_size(fallback=(120, 24)).columns
+    separators = 2 * (len(headers) - 1)
+    while sum(widths) + separators > available:
+        shrinkable = [
+            index
+            for index in flexible
+            if widths[index] > max(display_width(headers[index]), 8)
+        ]
+        if not shrinkable:
+            break
+        index = max(shrinkable, key=lambda item: widths[item])
+        widths[index] -= 1
+
+    def truncate(value: str, width: int) -> str:
+        if display_width(value) <= width:
+            return value
+        result = ""
+        used = 0
+        limit = max(0, width - display_width("…"))
+        for character in value:
+            character_width = display_width(character)
+            if used + character_width > limit:
+                break
+            result += character
+            used += character_width
+        return result + "…"
+
+    def pad(value: str, width: int) -> str:
+        return value + " " * max(0, width - display_width(value))
+
+    print("  ".join(pad(header, widths[i]) for i, header in enumerate(headers)))
+    print("  ".join("-" * width for width in widths))
+    for row in rendered:
+        print(
+            "  ".join(
+                pad(truncate(value, widths[i]), widths[i])
+                for i, value in enumerate(row)
+            )
+        )
+
+
+def latest_replies_file() -> Path:
+    files = list(TMP_DIR.glob("pi-hunk-replies-*.json"))
+    if not files:
+        raise ToolError(f"No generated replies files found in {TMP_DIR}")
+    return max(files, key=lambda path: path.stat().st_mtime)
+
+
+def show_replies(path: Path | None, as_json: bool) -> None:
+    path = path or latest_replies_file()
+    replies = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(replies, list):
+        raise ToolError("Replies file must contain a JSON array")
+
+    if as_json:
+        print(f"File: {path}", file=sys.stderr)
+        print(json.dumps(replies, indent=2, ensure_ascii=False))
+        return
+
+    print(f"File: {path}")
+    rows: list[list[Any]] = []
+    for reply in replies:
+        comments = " | ".join(
+            one_line(item.get("summary", "")) for item in source_comments(reply)
+        )
+        rows.append([reply.get("thread_id"), comments, reply.get("reply")])
+    print_table(["thread_id", "comments", "reply"], rows, flexible={1, 2})
+
+
+def apply_replies(url: str, replies_file: Path | None) -> None:
+    replies_file = replies_file or latest_replies_file()
+    print(f"File: {replies_file}")
+    try:
+        confirmed = input("Apply these replies and resolve their threads? [y/N] ")
+    except EOFError:
+        confirmed = ""
+    if confirmed.strip().lower() not in {"y", "yes"}:
+        print("Cancelled.")
+        return
+
+    replies = json.loads(replies_file.read_text(encoding="utf-8"))
+    if not isinstance(replies, list):
+        raise ToolError("Replies file must contain a JSON array")
+
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    info = parse_pr_url(url)
+    log_file = TMP_DIR / f"apply-replies-{info['pr']}.log"
+    with log_file.open("a", encoding="utf-8") as log:
+        for reply in replies:
+            thread_id = str(reply.get("thread_id", ""))
+            content = reply.get("reply")
+            if not thread_id or not isinstance(content, str):
+                raise ToolError("Each reply requires thread_id and reply fields")
+            posted = post_reply(url, thread_id, content)
+            resolved = resolve_thread(url, thread_id, "closed")
+            log.write(posted)
+            log.write("\n")
+            log.write(resolved)
+            log.write("\n---\n")
+            print(f"resolved: {thread_id}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    import_parser = commands.add_parser(
+        "import", help="Import active TFS comments into Hunk"
+    )
+    import_parser.add_argument("url", nargs="?", help="TFS pull-request URL")
+    import_parser.add_argument("--repo", type=Path, default=Path.cwd())
+
+    compile_parser = commands.add_parser(
+        "compile-replies", help="Compile replies from the current Hunk session"
+    )
+    compile_parser.add_argument("repo", nargs="?", type=Path, default=Path.cwd())
+
+    show_parser = commands.add_parser("show-replies", help="Display compiled replies")
+    show_parser.add_argument(
+        "file",
+        nargs="?",
+        type=Path,
+        help="replies file (default: most recently generated)",
+    )
+    show_parser.add_argument(
+        "--json", action="store_true", help="print the complete replies JSON"
+    )
+
+    apply_parser = commands.add_parser(
+        "apply-replies", help="Post replies and resolve their TFS threads"
+    )
+    apply_parser.add_argument(
+        "--file",
+        type=Path,
+        help="replies file (default: most recently generated)",
+    )
+    apply_parser.add_argument("url", nargs="?", help="TFS pull-request URL")
+
+    builds_parser = commands.add_parser("builds", help="List builds for a TFS pull request")
+    builds_parser.add_argument("url", nargs="?", help="TFS pull-request URL")
+    builds_parser.add_argument(
+        "--json", action="store_true", help="print build records as JSON"
+    )
+
+    build_status_parser = commands.add_parser(
+        "build-status", help="Print the status of one build"
+    )
+    build_status_parser.add_argument("build_id", type=int, help="TFS build ID")
+    build_status_parser.add_argument("url", nargs="?", help="TFS pull-request URL")
+
+    builds_status_parser = commands.add_parser(
+        "builds-status", help="Print the aggregate status of all PR builds"
+    )
+    builds_status_parser.add_argument("url", nargs="?", help="TFS pull-request URL")
+
+    api_parser = commands.add_parser("api", help="Low-level TFS API operations")
+    api_commands = api_parser.add_subparsers(dest="api_command", required=True)
+
+    fetch_parser = api_commands.add_parser("fetch-comments")
+    fetch_parser.add_argument("url", nargs="?", help="TFS pull-request URL")
+
+    post_parser = api_commands.add_parser("post-reply")
+    post_parser.add_argument("--thread-id", required=True)
+    post_parser.add_argument("--content", required=True)
+    post_parser.add_argument("url", nargs="?", help="TFS pull-request URL")
+
+    resolve_parser = api_commands.add_parser("resolve-thread")
+    resolve_parser.add_argument("--thread-id", required=True)
+    resolve_parser.add_argument(
+        "--status",
+        default="closed",
+        choices=["active", "fixed", "wontFix", "closed", "byDesign", "pending"],
+    )
+    resolve_parser.add_argument("url", nargs="?", help="TFS pull-request URL")
+
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        if args.command == "import":
+            url = require_url(args.url, args.repo)
+            if os.environ.get("TFS_IMPORT_NO_SPINNER"):
+                import_comments(url, args.repo)
+            else:
+                return run_import_with_spinner(url, args.repo)
+        elif args.command == "compile-replies":
+            print(compile_replies(args.repo))
+        elif args.command == "show-replies":
+            show_replies(args.file, args.json)
+        elif args.command == "apply-replies":
+            apply_replies(require_url(args.url), args.file)
+        elif args.command == "builds":
+            show_builds(require_url(args.url), args.json)
+        elif args.command == "build-status":
+            show_build_status(require_url(args.url), args.build_id)
+        elif args.command == "builds-status":
+            show_builds_status(require_url(args.url))
+        elif args.api_command == "fetch-comments":
+            print(fetch_comments(require_url(args.url)))
+        elif args.api_command == "post-reply":
+            print(post_reply(require_url(args.url), args.thread_id, args.content))
+        elif args.api_command == "resolve-thread":
+            response = resolve_thread(
+                require_url(args.url), args.thread_id, args.status
+            )
+            document = json.loads(response)
+            print(document.get("status", response))
+    except (ToolError, OSError, json.JSONDecodeError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
