@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+set -u
+
+docker run --rm -it \
+  -v "$PWD:/workspace" \
+  -v ~/.pi/agent:/root/.pi/agent \
+  pi-sandbox
+
