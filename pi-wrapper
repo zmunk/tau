@@ -5,6 +5,7 @@ set -u
 "$PI_HOME/bin/pi-hunk-relay" ensure
 
 docker run --rm -it \
+  --add-host=host.docker.internal:host-gateway \
   -v "$PWD:/workspace" \
   -v ~/.pi/agent:/root/.pi/agent \
    -e HOST_PWD="${PWD/#$HOME/~}" \
